@@ -100,7 +100,6 @@ Note: While Replit can compile the code, actual flashing needs to be done locall
 2. Current Calibration:
    - Use a known load (e.g., incandescent bulb)
    - Measure with calibrated meter
-   - Adjust CURRENT_CALIBRATION in config.h
    - Current value: 0.2728f based on CT ratio (1000:1) and 10Ω burden resistor
 
 3. Phase Calibration:

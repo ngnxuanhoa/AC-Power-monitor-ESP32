@@ -11,7 +11,7 @@ This project implements an AC power monitor using an ESP32 microcontroller, with
 ## Hardware Requirements
 - ESP32 development board
 - Current transformer OPCT10ATL-1000 with 10Ω burden resistor
-- Voltage divider (300kΩ + 2.2kΩ resistors)
+- Voltage divider ((3x100kΩ) + 2.2kΩ resistors)
 - LCD 1602 with I2C interface
 - SD card module
 - Appropriate power supply

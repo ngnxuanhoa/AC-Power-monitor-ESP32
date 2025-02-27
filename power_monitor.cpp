@@ -1,189 +1,134 @@
 #include "power_monitor.h"
 
-PowerMonitor::PowerMonitor(uint8_t current_pin, uint8_t voltage_pin) 
-    : _current_pin(current_pin), _voltage_pin(voltage_pin), _last_polarity(false) {
+PowerMonitor::PowerMonitor(uint8_t current_pin, uint8_t voltage_pin)
+    : _current_pin(current_pin), _voltage_pin(voltage_pin),
+      _voltage_dc(0), _voltage_ac(0), _current_ac(0),
+      _last_current(0), _filtered_offset(1880.0),
+      _power_w(0), _energy_kwh(0), _last_energy_update(0) {
 }
 
 void PowerMonitor::begin() {
-    Serial.println("Initializing Power Monitor...");
     pinMode(_current_pin, INPUT);
     pinMode(_voltage_pin, INPUT);
     analogReadResolution(ADC_BITS);
-    analogSetAttenuation(ADC_11db);
-    Serial.println("Power Monitor initialized");
+    analogSetAttenuation(ADC_11db);  // For input up to 3.3V
+    _last_energy_update = millis();
 }
 
-float PowerMonitor::readVoltageSample() {
-    int raw_value = analogRead(_voltage_pin);
-    // No need to center value since we're reading DC
-    float voltage = raw_value * VOLTAGE_CALIBRATION;
-
-    // Single stage filtering for DC
-    static float filtered_voltage = 0;
-    filtered_voltage = (VOLTAGE_SLOW_ALPHA * voltage) + ((1.0f - VOLTAGE_SLOW_ALPHA) * filtered_voltage);
-
-    // Convert back to AC RMS equivalent
-    return filtered_voltage * 1.414f; // Multiply by √2 to get AC peak
+void PowerMonitor::sampleVoltage() {
+    uint32_t sum = 0;
+    const int samples = 100;
+    for(int i = 0; i < samples; i++) {
+        sum += analogRead(_voltage_pin);
+        delay(1);
+    }
+    _voltage_ac = (sum / samples) * ADC_SCALE * 101.70; // Calibrated for 215.5V AC
 }
 
-float PowerMonitor::readCurrentSample() {
-    int raw_value = analogRead(_current_pin);
-    float centered_value = raw_value - (ADC_COUNTS/2);
+void PowerMonitor::updateEnergy() {
+    unsigned long now = millis();
+    float elapsed_hours = (now - _last_energy_update) / 3600000.0; // Convert ms to hours
 
-    // Enhanced debug output for current sensor
-    static unsigned long last_debug = 0;
-    if (millis() - last_debug > 1000) {
-        Serial.println("\n=== Current Sensor Debug ===");
-        Serial.print("Raw ADC: "); Serial.println(raw_value);
-        Serial.print("ADC Center: "); Serial.print(ADC_COUNTS/2);
-        Serial.print(" Centered Value: "); Serial.println(centered_value);
-        Serial.print("Deadband Threshold: "); Serial.println(ADC_COUNTS * 0.05); // Increased deadband
-        Serial.print("Calibration Factor: "); Serial.println(CURRENT_CALIBRATION, 6);
-        Serial.print("Pre-filter Current: "); Serial.println(centered_value * CURRENT_CALIBRATION, 4);
-        Serial.println("==========================");
-        last_debug = millis();
+    // Calculate power (V * I)
+    _power_w = _voltage_ac * _current_ac;
+
+    // Accumulate energy (power * time in hours)
+    _energy_kwh += (_power_w * elapsed_hours * WH_TO_KWH);
+
+    _last_energy_update = now;
+}
+
+void PowerMonitor::calculateCurrent() {
+    unsigned long start_time = micros();
+    double sum_squared = 0;
+    int samples_taken = 0;
+    int valid_samples = 0;
+    int range_violations = 0;
+    int32_t raw_max = 0, raw_min = 4095;
+    double sum_raw = 0;
+
+    // Calculate initial offset
+    double offset_sum = 0;
+    for(int i = 0; i < OFFSET_SAMPLES; i++) {
+        int32_t raw = analogRead(_current_pin);
+        offset_sum += raw;
+        delayMicroseconds(200);
+    }
+    double current_offset = offset_sum / OFFSET_SAMPLES;
+    _filtered_offset = (_filtered_offset * (1.0 - FILTER_ALPHA)) + 
+                        (current_offset * FILTER_ALPHA);
+
+    // Main sampling loop
+    double max_centered = 0;
+    for(int i = 0; i < SAMPLES_PER_CYCLE; i++) {
+        // Read raw ADC value
+        int32_t raw = analogRead(_current_pin);
+        if(raw > raw_max) raw_max = raw;
+        if(raw < raw_min) raw_min = raw;
+        sum_raw += raw;
+
+        // Check if ADC value is in valid range
+        if(raw < MIN_ADC_RANGE_LOW || raw > MIN_ADC_RANGE_HIGH) {
+            range_violations++;
+        }
+
+        // Center on filtered offset
+        double centered = raw - _filtered_offset;
+        if(abs(centered) > abs(max_centered)) {
+            max_centered = centered;
+        }
+
+        // Square the centered ADC value
+        double squared = centered * centered;
+
+        // Only accumulate if above threshold
+        if(squared > MIN_SQUARED_ADC) {
+            sum_squared += squared;
+            valid_samples++;
+        }
+        samples_taken++;
+
+        delayMicroseconds(200);
     }
 
-    // Increased deadband threshold to eliminate phantom readings
-    if (abs(centered_value) < (ADC_COUNTS * 0.05)) {
-        return 0.0f;
-    }
+    // Calculate final current if signal is valid
+    float new_current = 0;
+    double peak_to_peak = raw_max - raw_min;
+    int pct_valid = (valid_samples * 100) / samples_taken;
+    bool valid_signal = (valid_samples >= MIN_VALID_SAMPLES) &&
+                       (peak_to_peak >= MIN_PEAK_TO_PEAK) &&
+                       (pct_valid >= MIN_PCT_VALID_SAMPLES) &&
+                       (range_violations < samples_taken / 4);
 
-    // Enhanced filtering for current readings
-    static float current_buffer[5] = {0};
-    static int buffer_index = 0;
+    if(valid_signal) {
+        // Calculate RMS from valid samples
+        double rms_adc = sqrt(sum_squared / valid_samples);
+        double rms_voltage = rms_adc * ADC_SCALE;
+        double secondary_current = rms_voltage / CURRENT_BURDEN;
+        new_current = secondary_current * CT_TURNS * ICAL;
 
-    // Update buffer with new reading
-    current_buffer[buffer_index] = centered_value * CURRENT_CALIBRATION;
-    buffer_index = (buffer_index + 1) % 5;
-
-    // Calculate median for better noise rejection
-    float temp[5];
-    memcpy(temp, current_buffer, sizeof(current_buffer));
-    for(int i = 0; i < 4; i++) {
-        for(int j = 0; j < 4-i; j++) {
-            if(temp[j] > temp[j+1]) {
-                float swap = temp[j];
-                temp[j] = temp[j+1];
-                temp[j+1] = swap;
-            }
+        if(abs(new_current) < MIN_CURRENT) {
+            new_current = 0;
         }
     }
-    return temp[2]; // Return median value
+
+    // Apply smoothing
+    _current_ac = (_last_current * (1.0 - FILTER_ALPHA)) + 
+                    (new_current * FILTER_ALPHA);
+    _last_current = _current_ac;
+
+    // Calculate power and display final measurements
+    _power_w = _voltage_ac * _current_ac;
+
+    Serial.print("V: "); Serial.print(_voltage_ac, 1);
+    Serial.print("V, I: "); Serial.print(_current_ac, 2);
+    Serial.print("A, P: "); Serial.print(_power_w, 1);
+    Serial.print("W, E: "); Serial.print(_energy_kwh, 3);
+    Serial.println(isAboveMWhThreshold() ? " MWh" : " kWh");
 }
-
-void PowerMonitor::calculateParameters(int samples) {
-    Serial.println("\n=== Power Calculations Debug ===");
-
-    // Show raw sums with overflow protection
-    if (_voltage_sum > 1e9 || _current_sum > 1e9 || _power_sum > 1e9) {
-        Serial.println("WARNING: Sum overflow detected - resetting values");
-        _voltage_sum = 0;
-        _current_sum = 0;
-        _power_sum = 0;
-        return;
-    }
-
-    Serial.print("Raw Voltage Sum: "); Serial.println(_voltage_sum, 6);
-    Serial.print("Raw Current Sum: "); Serial.println(_current_sum, 6);
-    Serial.print("Raw Power Sum: "); Serial.println(_power_sum, 6);
-    Serial.print("Number of Samples: "); Serial.println(samples);
-
-    // Calculate and show RMS values with bounds checking
-    float v_rms = sqrt(max(_voltage_sum / samples, 0.0f));
-    float i_rms = sqrt(max(_current_sum / samples, 0.0f));
-
-    // Validate measurements before assigning
-    if (v_rms < 1000.0f && i_rms < 100.0f) {  // Reasonable limits
-        _voltage_rms = v_rms;
-        _current_rms = i_rms;
-        _real_power = _power_sum / samples;
-    } else {
-        Serial.println("ERROR: Invalid RMS values calculated - keeping previous values");
-        return;
-    }
-
-    Serial.print("RMS Voltage: "); Serial.println(_voltage_rms, 2);
-    Serial.print("RMS Current: "); Serial.println(_current_rms, 4);
-    Serial.print("Real Power (before sign check): "); Serial.println(_real_power, 2);
-
-    // Skip calculations if current is too low
-    if (_current_rms < MIN_VALID_CURRENT) {
-        Serial.println("Current below minimum threshold - zeroing measurements");
-        _current_rms = 0.0f;
-        _real_power = 0.0f;
-        _power_factor = 0.0f;
-        return;
-    }
-
-    // Calculate power factor and handle direction with bounds checking
-    float apparent_power = _voltage_rms * _current_rms;
-    if (apparent_power > 1e6) {  // Limit to 1MW for reasonable bounds
-        Serial.println("ERROR: Apparent power too high - calculation error");
-        return;
-    }
-    Serial.print("Apparent Power: "); Serial.println(apparent_power, 2);
-
-    if (apparent_power > 0.1) {
-        _power_factor = _real_power / apparent_power;
-        Serial.print("Initial Power Factor: "); Serial.println(_power_factor, 4);
-
-        // Handle power direction
-        if (_power_factor < 0) {
-            Serial.println("Negative power factor detected - adjusting direction");
-            _power_factor = -_power_factor;
-            _real_power = abs(_real_power);
-        }
-    } else {
-        _power_factor = 0.0f;
-        Serial.println("Apparent power too low - zeroing power factor");
-    }
-
-    Serial.print("Final Power Factor: "); Serial.println(_power_factor, 4);
-    Serial.print("Final Real Power: "); Serial.println(_real_power, 2);
-    Serial.print("Energy Consumption: "); Serial.print(_energy_kwh, 3); Serial.println(" kWh");
-    Serial.println("==============================");
-}
-
-// Zero crossing detection removed since using rectified DC voltage
 
 void PowerMonitor::update() {
-    // Update energy consumption
-    unsigned long now = millis();
-    if (_last_energy_update > 0 && _real_power > 0) {
-        float hours = (now - _last_energy_update) / 3600000.0f; // Convert ms to hours
-        _energy_kwh += (_real_power * hours) / 1000.0f; // Convert W to kW
-    }
-    _last_energy_update = now;
-
-    // Reset accumulators
-    _voltage_sum = 0;
-    _current_sum = 0;
-    _power_sum = 0;
-    int samples = 0;
-    unsigned long start_time = micros();
-
-    while (samples < SAMPLES_PER_CYCLE) {
-        float voltage_sample = readVoltageSample();
-        float current_sample = readCurrentSample();
-
-        // Fixed frequency since using rectified DC voltage
-        _frequency = MAINS_FREQUENCY;
-
-        // Accumulate measurements
-        _voltage_sum += voltage_sample * voltage_sample;
-        _current_sum += current_sample * current_sample;
-        _power_sum += voltage_sample * current_sample;
-        samples++;
-
-        // Wait for next sample
-        while (micros() - start_time < (samples * SAMPLING_INTERVAL));
-    }
-
-    calculateParameters(SAMPLES_PER_CYCLE);
-}
-
-bool PowerMonitor::isValid() const {
-    return (_voltage_rms >= MIN_VALID_VOLTAGE && _voltage_rms <= MAX_VALID_VOLTAGE &&
-            _current_rms >= MIN_VALID_CURRENT && _current_rms <= MAX_VALID_CURRENT);
+    sampleVoltage();
+    calculateCurrent();
+    updateEnergy();
 }

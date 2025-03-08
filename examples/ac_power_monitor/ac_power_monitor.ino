@@ -1,185 +1,449 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
 #include <SD.h>
 #include <SPI.h>
 #include "power_monitor.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <EEPROM.h>
+#include "button.h"
 
-// LCD I2C Configuration
-#define LCD_I2C_ADDR 0x27
-#define LCD_COLS 16
-#define LCD_ROWS 2
+// Pin Definitions
+#define CURRENT_PIN 36  // ADC1_CH0 (GPIO 36/VP/A0)
+#define VOLTAGE_PIN 39  // ADC1_CH3 (GPIO 39/VN/A3)
+#define SD_CS_PIN  5    // SD Card CS pin
 
-// SD Card pins for ESP32
-#define SD_CS_PIN     5    // SD Card CS pin
-#define SD_MOSI_PIN   23   // SD Card MOSI
-#define SD_MISO_PIN   19   // SD Card MISO
-#define SD_CLK_PIN    18   // SD Card CLK
+// Button Pins
+#define BTN_LEFT   27
+#define BTN_RIGHT  26
+#define BTN_BACK   25
+#define BTN_SELECT 33
 
-// Initialize LCD
-LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
+// Display modes
+#define DISPLAY_VI    0   // Voltage and Current
+#define DISPLAY_PE    1   // Power and Energy
+#define DISPLAY_SET   2   // Settings
 
-// Initialize PowerMonitor
-PowerMonitor power_monitor(CURRENT_PIN, VOLTAGE_PIN);
+// Task handle for UI task
+TaskHandle_t UITask;
 
-// File handling variables
-File dataFile;
-String filename;
-unsigned long lastLog = 0;
-const unsigned long LOG_INTERVAL = 1000; // Log every second
+// Mutex for display access
+SemaphoreHandle_t displayMutex;
 
-// Utility functions for SD card logging
-String getTimestamp() {
-    unsigned long timeSeconds = millis() / 1000;
-    int hours = timeSeconds / 3600;
-    int minutes = (timeSeconds % 3600) / 60;
-    int seconds = timeSeconds % 60;
+// EEPROM Configuration
+#define EEPROM_SIZE 64        // Size of EEPROM in bytes
+#define PHASE_MODE_ADDR 0     // Address to store phase mode
+#define SETTINGS_VALID_ADDR 1 // Address to store settings valid flag
+#define SETTINGS_VALID_VALUE 0x55 // Magic number to indicate valid settings
 
-    char timestamp[9];
-    sprintf(timestamp, "%02d:%02d:%02d", hours, minutes, seconds);
-    return String(timestamp);
-}
+// Create objects
+PowerMonitor powerMonitor(CURRENT_PIN, VOLTAGE_PIN, SINGLE_PHASE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // Most common address for LCD
+RTC_DS3231 rtc;
+String currentFileName;
 
-String createFilename() {
-    char filename[32];
-    unsigned long now = millis() / 1000;
-    sprintf(filename, "/POWER_%lu.CSV", now);
-    return String(filename);
-}
+// Button initialization
+Button btnLeft(BTN_LEFT);
+Button btnRight(BTN_RIGHT);
+Button btnBack(BTN_BACK);
+Button btnSelect(BTN_SELECT);
 
-void writeHeader(File& file) {
-    file.println("Timestamp,Voltage(V),Current(A),Power(W),PF,Frequency(Hz)");
-    Serial.println("Wrote CSV header to log file");
-}
+// Display state
+uint8_t displayMode = DISPLAY_VI;
+bool inSettings = false;
+bool phaseSettingSelected = false;
+volatile bool displayNeedsUpdate = false;
 
-bool setupSDCard() {
-    Serial.println("Initializing SD card...");
+// UI Task running on Core 1
+void UITaskCode(void * parameter) {
+    Serial.println("UI Task starting on core " + String(xPortGetCoreID()));
 
-    // Configure SPI pins for SD card
-    SPI.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    for(;;) {
+        // Handle buttons and update display if needed
+        bool buttonsChanged = handleButtons();
 
-    // Initialize SD card
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("SD Card initialization failed!");
-        return false;
+        if (displayNeedsUpdate || buttonsChanged) {
+            if (xSemaphoreTake(displayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                updateDisplay();
+                displayNeedsUpdate = false;
+                xSemaphoreGive(displayMutex);
+            }
+        }
+
+        // Regular yield
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-    Serial.println("SD Card initialized successfully");
-
-    // Create a new log file with timestamp
-    filename = createFilename();
-    dataFile = SD.open(filename, FILE_WRITE);
-
-    if (!dataFile) {
-        Serial.println("Failed to create log file!");
-        return false;
-    }
-    Serial.print("Log file created: ");
-    Serial.println(filename);
-
-    // Write CSV header
-    writeHeader(dataFile);
-    dataFile.close();
-    return true;
-}
-
-void logData() {
-    unsigned long now = millis();
-    if (now - lastLog < LOG_INTERVAL) {
-        return; // Not time to log yet
-    }
-    lastLog = now;
-
-    dataFile = SD.open(filename, FILE_APPEND);
-    if (!dataFile) {
-        Serial.println("Failed to open log file for writing!");
-        return;
-    }
-
-    // Format: timestamp,voltage,current,power,pf,frequency
-    String dataString = getTimestamp() + "," +
-                     String(power_monitor.getVoltageRMS(), 1) + "," +
-                     String(power_monitor.getCurrentRMS(), 3) + "," +
-                     String(power_monitor.getRealPower(), 1) + "," +
-                     String(power_monitor.getPowerFactor(), 3) + "," +
-                     String(power_monitor.getFrequency(), 1);
-
-    dataFile.println(dataString);
-    dataFile.close();
-
-    Serial.print("Logged data: ");
-    Serial.println(dataString);
 }
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\nAC Power Monitor Starting...");
+    delay(1000);
+    Serial.println("\nStarting AC Power Monitor...");
+
+    // Initialize EEPROM
+    if (!EEPROM.begin(EEPROM_SIZE)) {
+        Serial.println("Failed to initialize EEPROM!");
+        delay(1000);
+    }
+
+    // Load settings from EEPROM
+    loadSettings();
+
+    // Initialize I2C
+    Wire.begin(21, 22);  // SDA = 21, SCL = 22 for ESP32
+    Wire.setClock(100000);
+    delay(100);
 
     // Initialize LCD
-    Wire.begin();
-    lcd.init();
+    lcd.init();  // Initialize display
     lcd.backlight();
     lcd.clear();
-    lcd.print("AC Power Monitor");
-    lcd.setCursor(0, 1);
-    lcd.print("Initializing...");
-    delay(1000);
+    lcd.print("Starting...");
+
+    // Initialize RTC
+    if (!rtc.begin()) {
+        Serial.println("RTC failed!");
+        lcd.clear();
+        lcd.print("RTC Error!");
+        while (1) delay(100);
+    }
+
+    // Set RTC time if needed
+    if (rtc.lostPower()) {
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+
+    // Initialize SD card
+    SPI.begin();
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD card failed!");
+        lcd.clear();
+        lcd.print("SD Card Error!");
+        while (1) delay(100);
+    }
+
+    // Create initial log file
+    currentFileName = createFileName();
+    if (!SD.exists(currentFileName)) {
+        File dataFile = SD.open(currentFileName, FILE_WRITE);
+        if (dataFile) {
+            dataFile.println("Timestamp,Voltage(V),Current(A),Power(W),Energy(kWh)");
+            dataFile.close();
+        }
+    }
 
     // Initialize power monitor
-    power_monitor.begin();
-    Serial.println("Power monitor initialized");
+    powerMonitor.begin();
 
-    // Initialize SD card logging
+    // Create mutex for display access
+    displayMutex = xSemaphoreCreateMutex();
+
+    // Initialize buttons
+    btnLeft.begin();
+    btnRight.begin();
+    btnBack.begin();
+    btnSelect.begin();
+
+    // Create UI task on Core 1
+    xTaskCreatePinnedToCore(
+        UITaskCode,
+        "UITask",
+        8192,
+        NULL,
+        1,
+        &UITask,
+        1  // Run on Core 1
+    );
+
     lcd.clear();
-    lcd.print("SD Card Init...");
-    if (!setupSDCard()) {
-        lcd.clear();
-        lcd.print("SD Card Failed!");
-        Serial.println("SD Card initialization failed!");
-        while (true) delay(1000); // Halt if SD card fails
-    }
-    lcd.clear();
-    lcd.print("SD Card Ready");
-    Serial.println("SD Card initialized successfully");
+    lcd.print("Monitor Ready");
     delay(1000);
 }
 
 void loop() {
-    // Update measurements
-    power_monitor.update();
+    static unsigned long last_power_update = 0;
+    static unsigned long last_log_update = 0;
+    unsigned long current_time = millis();
 
-    static unsigned long display_toggle = 0;
-    static bool show_energy = false;
-    
-    if (millis() - display_toggle > 3000) { // Toggle display every 3 seconds
-        show_energy = !show_energy;
-        display_toggle = millis();
+    // Update power monitor readings every 100ms
+    if (current_time - last_power_update >= 100) {
+        powerMonitor.update();
+        last_power_update = current_time;
+
+        // Trigger display update
+        if (xSemaphoreTake(displayMutex, 0) == pdTRUE) {
+            displayNeedsUpdate = true;
+            xSemaphoreGive(displayMutex);
+        }
     }
-    
-    lcd.clear();
-    if (!show_energy) {
-        // First row: Voltage and Current
-        lcd.setCursor(0, 0);
-        lcd.print(power_monitor.getVoltageRMS(), 1);
-        lcd.print("V ");
-        lcd.print(power_monitor.getCurrentRMS(), 2);
-        lcd.print("A");
 
-        // Second row: Power and PF
-        lcd.setCursor(0, 1);
-        lcd.print(power_monitor.getRealPower(), 0);
-        lcd.print("W PF:");
-        lcd.print(power_monitor.getPowerFactor(), 2);
+    // Log data every minute
+    if (current_time - last_log_update >= 60000) {
+        logPowerData();
+        last_log_update = current_time;
+    }
+
+    // Small delay to prevent watchdog issues
+    delay(10);
+}
+
+
+bool handleButtons() {
+    bool displayNeedsUpdate = false;
+
+    // Update all buttons
+    btnLeft.update();
+    btnRight.update();
+    btnBack.update();
+    btnSelect.update();
+
+    // Handle SELECT button long press
+    if (!inSettings && btnSelect.isLongPress()) {
+        inSettings = true;
+        displayMode = DISPLAY_SET;
+        displayNeedsUpdate = true;
+    }
+
+    // Handle button presses
+    if (btnSelect.wasPressed()) {
+        if (!inSettings) {
+            // Toggle between V/I and P/E displays
+            displayMode = (displayMode == DISPLAY_VI) ? DISPLAY_PE : DISPLAY_VI;
+            displayNeedsUpdate = true;
+        } else if (inSettings) {
+            // Toggle phase setting selection
+            phaseSettingSelected = !phaseSettingSelected;
+            displayNeedsUpdate = true;
+        }
+    }
+
+    if (inSettings && phaseSettingSelected) {
+        if (btnLeft.wasPressed() || btnRight.wasPressed()) {
+            // Toggle between single and three phase
+            if (powerMonitor.getPhaseCount() == THREE_PHASE) {
+                powerMonitor = PowerMonitor(CURRENT_PIN, VOLTAGE_PIN, SINGLE_PHASE);
+            } else {
+                powerMonitor = PowerMonitor(CURRENT_PIN, VOLTAGE_PIN, THREE_PHASE);
+            }
+            powerMonitor.begin();
+            saveSettings(); // Save settings after phase mode change
+            displayNeedsUpdate = true;
+        }
+    }
+
+    if (inSettings && btnBack.wasPressed()) {
+        inSettings = false;
+        phaseSettingSelected = false;
+        displayMode = DISPLAY_VI;
+        displayNeedsUpdate = true;
+    }
+
+    return displayNeedsUpdate;
+}
+
+void updateDisplay() {
+    if (inSettings) {
+        displaySettingsScreen();
     } else {
-        // Show energy consumption
-        lcd.setCursor(0, 0);
-        lcd.print("Energy Usage:");
-        lcd.setCursor(0, 1);
-        lcd.print(power_monitor.getEnergyKWh(), 3);
-        lcd.print(" kWh");
+        displayMonitorScreen();
+    }
+}
+
+void displaySettingsScreen() {
+    static uint8_t lastPhaseCount = 0;
+    static bool lastPhaseSelected = false;
+
+    // Only update if something changed
+    if (lastPhaseCount == powerMonitor.getPhaseCount() && 
+        lastPhaseSelected == phaseSettingSelected) {
+        return;
     }
 
-    // Log data to SD card
-    logData();
+    // Clear only when changing screens
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Phase Mode:");
+    lcd.setCursor(0, 1);
+    lcd.print(powerMonitor.getPhaseCount() == THREE_PHASE ? "Three Phase" : "Single Phase");
 
-    // Small delay to prevent overwhelming the system
-    delay(100);
+    if (phaseSettingSelected) {
+        lcd.setCursor(15, 1);
+        lcd.print("*");
+    }
+
+    // Save current state
+    lastPhaseCount = powerMonitor.getPhaseCount();
+    lastPhaseSelected = phaseSettingSelected;
+}
+
+void displayMonitorScreen() {
+    static float lastVoltage = -1;
+    static float lastCurrent = -1;
+    static float lastPower = -1;
+    static float lastEnergy = -1;
+    static bool lastMWhState = false;
+    static uint8_t lastDisplayMode = 255;  // Force initial update
+
+    float voltage = powerMonitor.getVoltageAC();
+    float current = powerMonitor.getCurrentAC();
+    float power = powerMonitor.getPowerW();
+    float energy = powerMonitor.isAboveMWhThreshold() ? 
+                   powerMonitor.getEnergyMWh() : 
+                   powerMonitor.getEnergyKWh();
+    bool mwhState = powerMonitor.isAboveMWhThreshold();
+
+    // Check if values changed significantly or display mode changed
+    bool needsUpdate = (abs(voltage - lastVoltage) >= 0.1) ||
+                      (abs(current - lastCurrent) >= 0.01) ||
+                      (abs(power - lastPower) >= 0.1) ||
+                      (abs(energy - lastEnergy) >= 0.001) ||
+                      (mwhState != lastMWhState) ||
+                      (displayMode != lastDisplayMode);
+
+    if (!needsUpdate) {
+        return;
+    }
+
+    // Clear only when switching display modes
+    if (displayMode != lastDisplayMode) {
+        lcd.clear();
+        lastDisplayMode = displayMode;
+    }
+
+    if (displayMode == DISPLAY_PE) {
+        // Update power display with automatic unit conversion
+        lcd.setCursor(0, 0);
+        lcd.print("P: ");
+        if (power >= 1000) {
+            // Display in kW with 3 decimal places
+            lcd.print(power/1000.0, 3);
+            lcd.print("kW   ");
+        } else {
+            // Display in W with 1 decimal place
+            lcd.print(power, 1);
+            lcd.print("W    ");
+        }
+
+        // Update energy display
+        lcd.setCursor(0, 1);
+        lcd.print("E: ");
+        lcd.print(energy, 3);
+        lcd.print(mwhState ? "MWh  " : "kWh  ");
+    } else {
+        // Update voltage display
+        lcd.setCursor(0, 0);
+        lcd.print("V: ");
+        lcd.print(voltage, 1);
+        lcd.print("V");
+        if (powerMonitor.getPhaseCount() == THREE_PHASE) {
+            lcd.print("(3P)");
+        } else {
+            lcd.print("    ");  // Clear 3P if not used
+        }
+
+        // Update current display
+        lcd.setCursor(0, 1);
+        lcd.print("I: ");
+        lcd.print(current, 2);
+        lcd.print("A    ");  // Extra spaces to clear old characters
+    }
+
+    // Save current values
+    lastVoltage = voltage;
+    lastCurrent = current;
+    lastPower = power;
+    lastEnergy = energy;
+    lastMWhState = mwhState;
+}
+
+String getTimeStamp() {
+    DateTime now = rtc.now();
+    char timestamp[20];
+    sprintf(timestamp, "%02d:%02d:%02d",
+            now.hour(), now.minute(), now.second());
+    return String(timestamp);
+}
+
+String createFileName() {
+    DateTime now = rtc.now();
+    char fileName[32];
+    sprintf(fileName, "/POWER_%04d%02d%02d.CSV",
+            now.year(), now.month(), now.day());
+    return String(fileName);
+}
+
+void logPowerData() {
+    // Check if we need to create a new file for a new day
+    String newFileName = createFileName();
+    if (newFileName != currentFileName) {
+        currentFileName = newFileName;
+        File dataFile = SD.open(currentFileName, FILE_WRITE);
+        if (dataFile) {
+            dataFile.println("Timestamp,Voltage(V),Current(A),Power(W),Energy(kWh)");
+            dataFile.close();
+            Serial.println("Created new log file: " + currentFileName);
+        }
+    }
+
+    // Get current readings
+    float ac_voltage = powerMonitor.getVoltageAC();
+    float ac_current = powerMonitor.getCurrentAC();
+    float power = powerMonitor.getPowerW();
+    float energy = powerMonitor.getEnergyKWh();
+
+    String timestamp = getTimeStamp();
+    String dataString = timestamp + "," +
+                        String(ac_voltage, 1) + "," +
+                        String(ac_current, 2) + "," +
+                        String(power, 1) + "," +
+                        String(energy, 3);
+
+    File dataFile = SD.open(currentFileName, FILE_APPEND);
+    if (dataFile) {
+        dataFile.println(dataString);
+        dataFile.close();
+        Serial.println("Data logged: " + dataString);
+    }
+}
+
+// Add debug messages to loadSettings() function
+void loadSettings() {
+    Serial.println("\nLoading settings from EEPROM...");
+    if (EEPROM.read(SETTINGS_VALID_ADDR) == SETTINGS_VALID_VALUE) {
+        uint8_t phaseMode = EEPROM.read(PHASE_MODE_ADDR);
+        Serial.print("Read phase mode: ");
+        Serial.println(phaseMode);
+
+        if (phaseMode == THREE_PHASE || phaseMode == SINGLE_PHASE) {
+            // Create new power monitor with saved phase mode
+            powerMonitor = PowerMonitor(CURRENT_PIN, VOLTAGE_PIN, phaseMode);
+            Serial.print("Loaded phase mode from EEPROM: ");
+            Serial.println(phaseMode == THREE_PHASE ? "Three Phase" : "Single Phase");
+        } else {
+            Serial.println("Invalid phase mode in EEPROM, using default");
+            saveSettings(); // Save default settings
+        }
+    } else {
+        Serial.println("No valid settings found in EEPROM");
+        Serial.println("Saving default settings (Single Phase)");
+        saveSettings();
+    }
+}
+
+// Add debug messages to saveSettings() function
+void saveSettings() {
+    Serial.println("\nSaving settings to EEPROM...");
+    Serial.print("Phase mode: ");
+    Serial.println(powerMonitor.getPhaseCount() == THREE_PHASE ? "Three Phase" : "Single Phase");
+
+    EEPROM.write(SETTINGS_VALID_ADDR, SETTINGS_VALID_VALUE);
+    EEPROM.write(PHASE_MODE_ADDR, powerMonitor.getPhaseCount());
+
+    if (EEPROM.commit()) {
+        Serial.println("Settings saved successfully");
+    } else {
+        Serial.println("Error saving settings!");
+    }
 }
